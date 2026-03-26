@@ -22,7 +22,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/YOUR_USERNAME/mac-clean-scripts.git
+git clone https://github.com/jacobyao0/mac-clean-scripts.git
 cd mac-clean-scripts
 
 # 复制到本地 bin 目录
