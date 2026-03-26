@@ -1,5 +1,7 @@
 # Mac Clean Scripts
 
+中文 | [English](README_EN.md)
+
 安全、全面的 Mac 系统自动清理脚本
 
 ## ✨ 特性
