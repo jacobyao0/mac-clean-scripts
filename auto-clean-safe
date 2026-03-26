@@ -1,0 +1,433 @@
+#!/bin/zsh
+# 安全全面的 Mac 自动清理脚本
+# 原则：只删内容，保留目录结构；运行中的应用不碰；优先官方命令
+
+set -o pipefail
+
+# 加载用户配置（确保 crontab 能找到 brew、npm 等命令）
+source ~/.zshrc 2>/dev/null || true
+
+LOG_FILE="$HOME/.cache/auto-clean.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+
+# 日志轮转：超过 1MB 就清空
+if [[ -f "$LOG_FILE" ]] && [[ $(stat -f%z "$LOG_FILE" 2>/dev/null) -gt 1048576 ]]; then
+    : > "$LOG_FILE"
+fi
+
+# 提前获取磁盘信息（避免 log 函数时序问题）
+DISK_BEFORE=$(df -h / | tail -1 | awk '{print $4}')
+TOTAL_SAVED=0
+SAVED_THIS_OP=0
+
+# 辅助函数：安全清理目录内容（保留目录本身）
+safe_clean_dir() {
+    local dir="$1"
+    if [[ -d "$dir" ]]; then
+        local before=$(du -sk "$dir" 2>/dev/null | cut -f1)
+        # 只删除目录内的内容，保留目录结构
+        find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+        local after=$(du -sk "$dir" 2>/dev/null | cut -f1)
+        SAVED_THIS_OP=$(( (before - after) / 1024 ))
+        TOTAL_SAVED=$((TOTAL_SAVED + SAVED_THIS_OP))
+        return 0
+    fi
+    SAVED_THIS_OP=0
+    return 1
+}
+
+# 辅助函数：检查应用是否在运行
+is_running() {
+    pgrep -xq "$1" 2>/dev/null
+    return $?
+}
+
+log() {
+    echo "$1" | tee -a "$LOG_FILE"
+}
+
+log "========== 安全清理开始 $(date) =========="
+log "清理前可用空间: $DISK_BEFORE"
+
+# ========== 阶段1: 开发工具（100%安全，官方支持） ==========
+log ""
+log "--- 阶段1: 开发工具缓存（官方命令）---"
+
+# Homebrew
+if command -v brew &>/dev/null; then
+    BREW_OUT=$(brew cleanup --prune=all 2>&1)
+    if [[ -n "$BREW_OUT" ]]; then
+        log "🧹 Homebrew: 已清理"
+        echo "$BREW_OUT" | grep -E "[0-9]+\.[0-9]+[KMGT]B" | head -3 | while read line; do
+            log "   $line"
+        done
+    else
+        log "✅ Homebrew: 无需清理"
+    fi
+fi
+
+# uv
+if command -v uv &>/dev/null; then
+    UV_BEFORE=$(du -sk ~/.cache/uv 2>/dev/null | cut -f1)
+    uv cache prune 2>/dev/null
+    UV_AFTER=$(du -sk ~/.cache/uv 2>/dev/null | cut -f1)
+    SAVED_THIS_OP=$(( (UV_BEFORE - UV_AFTER) / 1024 ))
+    TOTAL_SAVED=$((TOTAL_SAVED + SAVED_THIS_OP))
+    [[ $SAVED_THIS_OP -gt 0 ]] && log "🧹 uv cache: ${SAVED_THIS_OP}M"
+fi
+
+# npm (使用官方命令)
+if command -v npm &>/dev/null; then
+    npm cache clean --force 2>/dev/null && log "🧹 npm cache: 已清理"
+fi
+
+# yarn
+if command -v yarn &>/dev/null; then
+    yarn cache clean 2>/dev/null && log "🧹 yarn cache: 已清理"
+fi
+
+# pnpm
+if command -v pnpm &>/dev/null; then
+    pnpm store prune 2>/dev/null && log "🧹 pnpm store: 已清理"
+fi
+
+# CocoaPods
+if command -v pod &>/dev/null; then
+    pod cache clean --all 2>/dev/null && log "🧹 CocoaPods cache: 已清理"
+fi
+
+# Gem
+if command -v gem &>/dev/null; then
+    gem cleanup 2>/dev/null && log "🧹 Gem: 已清理"
+fi
+
+# ========== 阶段2: 系统临时文件（100%安全） ==========
+log ""
+log "--- 阶段2: 系统临时文件 ---"
+
+# 用户临时目录（只删3天以上的文件）
+if [[ -n "$TMPDIR" ]] && [[ -d "$TMPDIR" ]]; then
+    BEFORE=$(du -sk "$TMPDIR" 2>/dev/null | cut -f1)
+    find "$TMPDIR" -type f -mtime +3 -delete 2>/dev/null
+    find "$TMPDIR" -type d -empty -delete 2>/dev/null
+    AFTER=$(du -sk "$TMPDIR" 2>/dev/null | cut -f1)
+    SAVED_THIS_OP=$(( (BEFORE - AFTER) / 1024 ))
+    TOTAL_SAVED=$((TOTAL_SAVED + SAVED_THIS_OP))
+    [[ $SAVED_THIS_OP -gt 0 ]] && log "🧹 临时文件: ${SAVED_THIS_OP}M"
+fi
+
+# /tmp 和 /var/tmp（系统会自动清理，但我们帮忙清理明显的旧文件）
+find /tmp -type f -mtime +7 -delete 2>/dev/null
+find /var/tmp -type f -mtime +7 -delete 2>/dev/null
+
+# ========== 阶段3: 应用缓存（安全子目录） ==========
+log ""
+log "--- 阶段3: 应用缓存（安全子目录）---"
+
+# 系统级缓存（安全删除内容）
+for cache_dir in \
+    "$HOME/Library/Caches/com.apple.Music" \
+    "$HOME/Library/Caches/GeoServices" \
+    "$HOME/Library/Caches/vscode-cpptools" \
+    "$HOME/Library/Caches/com.apple.helpd" \
+    "$HOME/Library/Caches/com.apple.CloudTelemetry" \
+    "$HOME/Library/Caches/icloudmailagent"
+do
+    if [[ -d "$cache_dir" ]]; then
+        safe_clean_dir "$cache_dir"
+        [[ $SAVED_THIS_OP -gt 10 ]] && log "🧹 $(basename "$cache_dir"): ${SAVED_THIS_OP}M"
+    fi
+done
+
+# Chrome 缓存（Chrome 不在运行时清理）
+if ! is_running "Google Chrome"; then
+    CHROME_CACHE=(
+        "$HOME/Library/Caches/Google/Chrome/Default/Cache"
+        "$HOME/Library/Caches/Google/Chrome/Default/Code Cache"
+    )
+    for dir in $CHROME_CACHE; do
+        safe_clean_dir "$dir"
+    done
+    [[ $SAVED_THIS_OP -gt 0 ]] && log "🧹 Chrome 缓存: ${SAVED_THIS_OP}M"
+else
+    log "⏭️ Chrome 正在运行，跳过"
+fi
+
+# Safari 缓存（Safari 不在运行时清理）
+if ! is_running "Safari"; then
+    safe_clean_dir "$HOME/Library/Caches/com.apple.Safari"
+    [[ $SAVED_THIS_OP -gt 0 ]] && log "🧹 Safari 缓存: ${SAVED_THIS_OP}M"
+else
+    log "⏭️ Safari 正在运行，跳过"
+fi
+
+# Firefox
+if ! is_running "firefox"; then
+    safe_clean_dir "$HOME/Library/Caches/Firefox"
+    [[ $SAVED_THIS_OP -gt 0 ]] && log "🧹 Firefox 缓存: ${SAVED_THIS_OP}M"
+fi
+
+# VS Code（不在运行时清理）
+if ! is_running "Code"; then
+    # 只清理旧版本的 CachedData
+    if [[ -d "$HOME/Library/Application Support/Code/CachedData" ]]; then
+        CURRENT_HASH=$(code --version 2>/dev/null | sed -n '2p')
+        for dir in "$HOME/Library/Application Support/Code/CachedData"/*(/N); do
+            [[ "${dir:t}" == "$CURRENT_HASH" ]] && continue
+            safe_clean_dir "$dir"
+        done
+        [[ $SAVED_THIS_OP -gt 0 ]] && log "🧹 VS Code 旧版本缓存: ${SAVED_THIS_OP}M"
+    fi
+    
+    # VS Code 系统缓存
+    safe_clean_dir "$HOME/Library/Caches/com.microsoft.VSCode.ShipIt"
+else
+    log "⏭️ VS Code 正在运行，跳过"
+fi
+
+# Spotify
+if ! is_running "Spotify"; then
+    safe_clean_dir "$HOME/Library/Caches/com.spotify.client"
+    [[ $SAVED_THIS_OP -gt 0 ]] && log "🧹 Spotify 缓存: ${SAVED_THIS_OP}M"
+fi
+
+# ========== 阶段4: 开发相关（安全） ==========
+log ""
+log "--- 阶段4: 开发环境 ---"
+
+# Xcode DerivedData（可以安全删除，只是重新编译慢）
+if [[ -d "$HOME/Library/Developer/Xcode/DerivedData" ]]; then
+    BEFORE=$(du -sk "$HOME/Library/Developer/Xcode/DerivedData" 2>/dev/null | cut -f1)
+    safe_clean_dir "$HOME/Library/Developer/Xcode/DerivedData"
+    [[ $SAVED_THIS_OP -gt 0 ]] && log "🧹 Xcode 编译缓存: ${SAVED_THIS_OP}M"
+fi
+
+# Python __pycache__（安全）
+PYC_COUNT=$(find "$HOME/.local" -maxdepth 5 -type d -name "__pycache__" 2>/dev/null | wc -l)
+if [[ $PYC_COUNT -gt 0 ]]; then
+    find "$HOME/.local" -maxdepth 5 -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
+    log "🧹 Python __pycache__: $PYC_COUNT 个目录"
+fi
+
+# Gradle 缓存（Android 开发）
+if [[ -d "$HOME/.gradle/caches" ]]; then
+    safe_clean_dir "$HOME/.gradle/caches"
+    [[ $SAVED_THIS_OP -gt 0 ]] && log "🧹 Gradle 缓存: ${SAVED_THIS_OP}M"
+fi
+
+# ========== 阶段5: 日志和下载残留 ==========
+log ""
+log "--- 阶段5: 日志和下载残留 ---"
+
+# 用户日志（30天以上）
+LOG_BEFORE=$(du -sk "$HOME/Library/Logs" 2>/dev/null | cut -f1)
+find "$HOME/Library/Logs" -type f -name "*.log" -mtime +30 -delete 2>/dev/null
+find "$HOME/Library/Logs" -type f -name "*.log.old" -delete 2>/dev/null
+LOG_AFTER=$(du -sk "$HOME/Library/Logs" 2>/dev/null | cut -f1)
+SAVED_THIS_OP=$(( (LOG_BEFORE - LOG_AFTER) / 1024 ))
+TOTAL_SAVED=$((TOTAL_SAVED + SAVED_THIS_OP))
+[[ $SAVED_THIS_OP -gt 0 ]] && log "🧹 日志文件: ${SAVED_THIS_OP}M"
+
+# 崩溃报告（90天以上）
+find "$HOME/Library/Logs/DiagnosticReports" -type f -mtime +90 -delete 2>/dev/null
+
+# 下载临时文件
+DOWNLOAD_CLEANED=0
+for pattern in "$HOME/Downloads"/*.crdownload(N) "$HOME/Downloads"/*.part(N) "$HOME/Downloads"/*.download(N); do
+    if [[ -f "$pattern" ]]; then
+        size=$(stat -f%z "$pattern" 2>/dev/null || stat -c%s "$pattern" 2>/dev/null)
+        rm -f "$pattern"
+        DOWNLOAD_CLEANED=$((DOWNLOAD_CLEANED + size / 1024 / 1024))
+    fi
+done
+TOTAL_SAVED=$((TOTAL_SAVED + DOWNLOAD_CLEANED))
+[[ $DOWNLOAD_CLEANED -gt 0 ]] && log "🧹 下载残留: ${DOWNLOAD_CLEANED}M"
+
+# ========== 阶段6: Kimi CLI 自动清理（空白/垃圾） ==========
+log ""
+log "--- 阶段6: Kimi CLI 自动清理 ---"
+
+# 6.1 清理空会话目录（无文件）
+if [[ -d "$HOME/.kimi/sessions" ]]; then
+    EMPTY_DIRS=0
+    for dir in "$HOME/.kimi/sessions"/*(/N); do
+        if [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]; then
+            rmdir "$dir" 2>/dev/null
+            ((EMPTY_DIRS++))
+        fi
+    done
+    [[ $EMPTY_DIRS -gt 0 ]] && log "🧹 Kimi 空目录: $EMPTY_DIRS 个"
+fi
+
+# 6.2 清理空文件会话（0字节的 context.jsonl）
+if [[ -d "$HOME/.kimi/sessions" ]]; then
+    EMPTY_FILES=0
+    while IFS= read -r -d '' file; do
+        rm -rf "$(dirname "$file")" 2>/dev/null
+        ((EMPTY_FILES++))
+    done < <(find "$HOME/.kimi/sessions" -name "context.jsonl" -size 0 -print0 2>/dev/null)
+    [[ $EMPTY_FILES -gt 0 ]] && log "🧹 Kimi 空会话: $EMPTY_FILES 个"
+fi
+
+# 6.3 清理 CLI 临时图片缓存
+if [[ -d /tmp/kimi/images ]]; then
+    IMG_COUNT=$(find /tmp/kimi/images -type f 2>/dev/null | wc -l)
+    if [[ $IMG_COUNT -gt 0 ]]; then
+        IMG_SIZE=$(du -sh /tmp/kimi/images 2>/dev/null | cut -f1)
+        rm -rf /tmp/kimi/images/*
+        log "🧹 Kimi CLI 图片缓存: $IMG_COUNT 个文件 ($IMG_SIZE)"
+    fi
+fi
+
+# 6.4 清理 Kimi App 缓存（精细子目录，保留登录状态）
+if [[ -d ~/Library/Caches/KimiAppCache ]]; then
+    KIMI_BEFORE=$(du -sk ~/Library/Caches/KimiAppCache 2>/dev/null | cut -f1)
+    KIMI_CACHE_DIR=~/Library/Caches/KimiAppCache
+    
+    SAFE_DIRS=(
+        "cef_cache/Default/Cache"
+        "cef_cache/Default/Code Cache"
+        "cef_cache/Default/GPUCache"
+        "image_cache"
+    )
+    
+    for dir in "${SAFE_DIRS[@]}"; do
+        full_path="$KIMI_CACHE_DIR/$dir"
+        if [[ -d "$full_path" ]]; then
+            find "$full_path" -depth -mindepth 1 -delete 2>/dev/null
+        fi
+    done
+    
+    find "$KIMI_CACHE_DIR" -maxdepth 1 -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.gif" -o -iname "*.webp" -o -iname "*.svg" -o -iname "*.avif" -o -iname "*.heic" \) -delete 2>/dev/null
+    
+    KIMI_AFTER=$(du -sk ~/Library/Caches/KimiAppCache 2>/dev/null | cut -f1)
+    KIMI_CLEANED=$(( (KIMI_BEFORE - KIMI_AFTER) / 1024 ))
+    [[ $KIMI_CLEANED -gt 0 ]] && log "🧹 Kimi App 缓存: ${KIMI_CLEANED}M"
+fi
+
+# ========== 阶段7: 容器应用缓存（安全子目录） ==========
+log ""
+log "--- 阶段7: 容器应用缓存（安全子目录）---"
+
+# 定义要清理的容器应用列表（只清理 Caches 和 HTTPStorages/Cache.db，保留用户数据）
+typeset -A CONTAINER_CACHES
+CONTAINER_CACHES=(
+    # 用户安装的应用
+    "com.hezongyidev.Bob" "Bob翻译"
+    "QReader.MarginStudy.easy" "MarginNote"
+    
+    # 常见应用（如果有的话）
+    "com.tencent.xinWeChat" "微信"
+    "com.tencent.qq" "QQ"
+    "com.dingtalk.mac" "钉钉"
+    "com.larksuite.desktop" "飞书"
+    "com.electron.spark" "Spark邮箱"
+    "com.readdle.smartemail.integrated" "Spark"
+    "com.apple.mail" "邮件"
+    
+    # 系统应用（通常是安全的）
+    "com.apple.wallpaper.agent" "壁纸"
+    "com.apple.mediaanalysisd" "媒体分析"
+    "com.apple.iBooksX" "图书"
+    "com.apple.AppStore" "AppStore"
+    "com.apple.podcasts" "播客"
+    "com.apple.Maps" "地图"
+    "com.apple.weather" "天气"
+)
+
+# 循环清理容器缓存
+for bundle_id name in "${(@kv)CONTAINER_CACHES}"; do
+    container_base="$HOME/Library/Containers/$bundle_id/Data/Library"
+    local app_total=0  # 应用内总计
+    
+    # 清理 Caches（安全的缓存）
+    if [[ -d "$container_base/Caches" ]]; then
+        safe_clean_dir "$container_base/Caches"
+        app_total=$((app_total + SAVED_THIS_OP))
+    fi
+    
+    # 保守清理 HTTPStorages：只删 Cache.db，保留 Cookies（避免重新登录）
+    if [[ -f "$container_base/HTTPStorages/Cache.db" ]]; then
+        local http_size=0
+        http_size=$(stat -f%z "$container_base/HTTPStorages/Cache.db" 2>/dev/null || echo 0)
+        rm -f "$container_base/HTTPStorages/Cache.db" 2>/dev/null
+        local http_size_mb=$((http_size / 1024 / 1024))
+        app_total=$((app_total + http_size_mb))
+        TOTAL_SAVED=$((TOTAL_SAVED + http_size_mb))
+    fi
+    
+    # 统一输出该应用的总释放量
+    [[ $app_total -gt 0 ]] && log "🧹 $name: ${app_total}M"
+done
+
+# ========== 阶段8: VS Code 插件旧版本清理 ==========
+log ""
+log "--- 阶段8: VS Code 插件版本 ---"
+
+if [[ -d "$HOME/.vscode/extensions" ]]; then
+    EXT_DIR="$HOME/.vscode/extensions"
+    PLUGINS_CLEANED=0
+    PLUGINS_SAVED=0
+    KEEP_COUNT=1  # 保留最近 N 个版本
+    
+    # 临时开启 extendedglob
+    setopt localoptions extendedglob
+    typeset -A processed_bases
+    
+    # 遍历所有插件目录
+    for plugin_path in "$EXT_DIR"/*(/N); do
+        plugin_name="${plugin_path:t}"
+        
+        # 提取插件基础名称（不含版本号）
+        if [[ "$plugin_name" =~ ^([a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)-[0-9.] ]]; then
+            base_name="${match[1]}"
+            
+            # 跳过已处理的
+            [[ -n "${processed_bases[$base_name]}" ]] && continue
+            processed_bases[$base_name]=1
+            
+            # 获取该插件的所有版本
+            versions=("$EXT_DIR"/"${base_name}"-[0-9.]##(N))
+            [[ ${#versions[@]} -eq 0 ]] && continue
+            
+            # 如果有多于 KEEP_COUNT 个版本
+            if [[ ${#versions[@]} -gt $KEEP_COUNT ]]; then
+                # 按修改时间排序（最新的在前）
+                sorted=("$EXT_DIR"/"${base_name}"-[0-9.]##(N-om))
+                
+                for ((i=KEEP_COUNT+1; i<=${#sorted[@]}; i++)); do
+                    old="${sorted[$i]}"
+                    [[ -d "$old" ]] || continue
+                    
+                    size=$(($(du -sk "$old" 2>/dev/null | cut -f1) / 1024))
+                    rm -rf "$old"
+                    ((PLUGINS_CLEANED++))
+                    ((PLUGINS_SAVED+=size))
+                done
+            fi
+        fi
+    done
+    
+    TOTAL_SAVED=$((TOTAL_SAVED + PLUGINS_SAVED))
+    [[ $PLUGINS_CLEANED -gt 0 ]] && log "🧹 VS Code 插件旧版本: 清理 $PLUGINS_CLEANED 个 (${PLUGINS_SAVED}M)"
+fi
+
+# ========== 总结 ==========
+log ""
+log ""
+log "========== 清理总结 =========="
+log "✅ 总计释放: ${TOTAL_SAVED}M"
+log "清理后可用空间: $(df -h / | tail -1 | awk '{print $4}')"
+log "========== 完成 $(date) =========="
+log ""
+
+# 如果释放超过 1GB，显示提醒
+if [[ $TOTAL_SAVED -gt 1024 ]]; then
+    GB=$((TOTAL_SAVED / 1024))
+    log "🎉 释放超过 ${GB}GB 空间！"
+fi
+
+# macOS 通知（释放超过 500MB 时弹窗）
+if [[ $TOTAL_SAVED -gt 500 ]]; then
+    osascript -e "display notification \"释放了 ${TOTAL_SAVED}MB 空间\" with title \"自动清理完成\" sound name \"default\"" 2>/dev/null || true
+fi
